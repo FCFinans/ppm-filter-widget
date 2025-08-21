@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PPM-filter Widget</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --card: #ffffff;
+    --text: #0b1220;
+    --muted: #4b5563;
+    --border: #e5e7eb;
+    --accent: #1d4ed8;
+    --head: #f8fafc;
+    --hover: #f1f5ff;
+    --chip: #f3f4f6;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+  .wrap { max-width:100%; padding:12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .input, select { flex:1 1 220px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; }
+  button { padding:8px 12px; border:1px solid var(--border); background:#fff; border-radius:6px; cursor:pointer; }
+  button:hover { border-color: var(--accent); }
+  table { width:100%; border-collapse: collapse; font-size:14px; margin-top:10px; }
+  thead th { background:var(--head); cursor:pointer; border-bottom:1px solid var(--border); padding:6px; position:sticky; top:0; }
+  tbody td { border-bottom:1px solid var(--border); padding:6px; }
+  tbody tr:hover { background:var(--hover); }
+  .pill { background:var(--chip); border:1px solid var(--border); border-radius:999px; padding:2px 6px; font-size:12px; }
+  @media print {
+    .controls {display:none;}
+    .card {border:none; box-shadow:none;}
+    table {font-size:12px; border:1px solid #000;}
+    thead th, tbody td {border:1px solid #000;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="controls card">
+    <div class="row">
+      <input id="globalSearch" class="input" placeholder="🔎 Global sökning..." />
+      <button id="clearBtn">Rensa filter</button>
+      <button id="csvBtn">Exportera CSV</button>
+      <button onclick="window.print()">🖨️ Skriv ut</button>
+    </div>
+    <div class="row" id="columnFilters" style="margin-top:8px;"></div>
+  </div>
+  <div class="card" style="margin-top:10px; overflow:auto;">
+    <table id="dataTable">
+      <thead id="thead"></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // Auto-resize for embedding via iframe
+  function postHeight(){
+    try {
+      const h = document.documentElement.scrollHeight || document.body.scrollHeight;
+      parent.postMessage({ type: 'ppmWidgetHeight', height: h }, '*');
+    } catch(e) {}
+  }
+  window.addEventListener('load', postHeight);
+  new ResizeObserver(postHeight).observe(document.documentElement);
+
+  const RISK_ORDER = ["Mycket hög","hög","medel","låg","mycket låg","-"];
+  const riskRank = new Map(RISK_ORDER.map((v,i)=>[v.toLowerCase(), i]));
+  const norm = v => (v??'').toString().trim();
+  const lower = v => norm(v).toLowerCase();
+  function parsePercent(val){
+    const s = norm(val).replace(',','.').replace(/\s/g,'');
+    const m = s.match(/^(-?\d+(?:\.\d+)?)%?$/);
+    if (m) return parseFloat(m[1]);
+    const n = parseFloat(s);
+    return isNaN(n) ? NaN : n;
+  }
+  function formatPercent(val){
+    let n = parsePercent(val);
+    if (isNaN(n)) return norm(val);
+    const hadPercent = /%$/.test(norm(val));
+    if (!hadPercent && n <= 1) n *= 100;
+    return n.toFixed(2).replace('.',',') + ' %';
+  }
+  function isHttp(v){ return /^https?:\/\//i.test(norm(v)); }
+
+  let COLUMNS=[], DATA=[], META=null;
+  let sortKey=null, sortDir=1;
+  let filters = { global:'', cols:{} };
+  const uniqueMap = {};
+
+  function buildColumnFilters(){
+    const host = document.getElementById('columnFilters');
+    host.innerHTML='';
+    const DROPDOWN_COLS = new Set();
+    COLUMNS.forEach(c=>{ const size = uniqueMap[c].size; if (size>1 && size<=40) DROPDOWN_COLS.add(c); });
+    if (META.risk_col) DROPDOWN_COLS.add(META.risk_col);
+
+    COLUMNS.forEach(col=>{
+      const wrap = document.createElement('div');
+      wrap.style.flex = '1 1 220px';
+      if (DROPDOWN_COLS.has(col)){
+        const sel = document.createElement('select');
+        const optAny = document.createElement('option');
+        optAny.value=''; optAny.textContent = col + ' (alla)';
+        sel.appendChild(optAny);
+
+        let vals = Array.from(uniqueMap[col]).filter(v=>v!=='');
+        if (META.risk_col && col===META.risk_col){
+          const inData = new Set(vals.map(v=>v.toLowerCase()));
+          const ordered = RISK_ORDER.filter(v=>inData.has(v.toLowerCase()));
+          const extras = vals.filter(v=>!inData.has(v.toLowerCase())).sort((a,b)=>a.localeCompare(b,'sv'));
+          vals = [...ordered, ...extras];
+        } else {
+          vals = vals.sort((a,b)=>a.localeCompare(b,'sv', {numeric:true}));
+        }
+
+        vals.forEach(v=>{
+          const o = document.createElement('option');
+          o.value=v; o.textContent=v; sel.appendChild(o);
+        });
+        sel.onchange = ()=>{ filters.cols[col]=sel.value; render(); };
+        wrap.appendChild(sel);
+      } else {
+        const inp = document.createElement('input');
+        inp.className='input'; inp.placeholder = col + ' (filtrera)';
+        let t; inp.oninput = ()=>{ clearTimeout(t); t=setTimeout(()=>{ filters.cols[col]=inp.value; render(); }, 160); };
+        wrap.appendChild(inp);
+      }
+      host.appendChild(wrap);
+    });
+  }
+
+  function applyFilters(rows){
+    const g = lower(filters.global);
+    return rows.filter(r=>{
+      if (g){
+        const anyHit = COLUMNS.some(c=> lower(r[c]).includes(g));
+        if (!anyHit) return false;
+      }
+      for (const c of COLUMNS){
+        const f = lower(filters.cols[c]||'');
+        if (!f) continue;
+        const val = lower(r[c]);
+        if (f && val !== f && !val.includes(f)) return false;
+      }
+      return true;
+    });
+  }
+
+  function sortRows(rows){
+    if (!sortKey) return rows;
+    if (META.risk_col && sortKey === META.risk_col){
+      return [...rows].sort((a,b)=>{
+        const av = lower(a[sortKey]); const bv = lower(b[sortKey]);
+        const ar = riskRank.has(av)? riskRank.get(av):999;
+        const br = riskRank.has(bv)? riskRank.get(bv):999;
+        return sortDir * (ar - br || av.localeCompare(bv,'sv'));
+      });
+    }
+    if (META.fee_cols && META.fee_cols.includes(sortKey)){
+      return [...rows].sort((a,b)=> sortDir * (parsePercent(a[sortKey]) - parsePercent(b[sortKey])));
+    }
+    const collator = new Intl.Collator('sv', {numeric:true, sensitivity:'base'});
+    return [...rows].sort((a,b)=> sortDir * collator.compare(norm(a[sortKey]), norm(b[sortKey])));
+  }
+
+  function hyperlinkify(col, row, value){
+    const v = norm(value);
+    if (META.fund_name_col && col === META.fund_name_col && META.fund_url_col && norm(row[META.fund_url_col])){
+      const link = norm(row[META.fund_url_col]);
+      const a = document.createElement('a');
+      a.href = isHttp(link)? link : ('https://' + link);
+      a.textContent = v || link;
+      a.target="_blank"; a.rel="noopener";
+      a.style.color="var(--accent)";
+      return a;
+    }
+    if (isHttp(v)){
+      const a = document.createElement('a');
+      a.href = v; a.textContent = v; a.target="_blank"; a.rel="noopener";
+      a.style.color="var(--accent)";
+      return a;
+    }
+    if (META.fee_cols && META.fee_cols.includes(col)){
+      return document.createTextNode(formatPercent(v));
+    }
+    if (/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(v)){
+      const span = document.createElement('span'); span.textContent=v; span.className='pill'; return span;
+    }
+    return document.createTextNode(v);
+  }
+
+  function renderTableHead(){
+    const thead = document.getElementById('thead');
+    thead.innerHTML = '';
+    const tr = document.createElement('tr');
+    COLUMNS.forEach(col=>{
+      const th = document.createElement('th');
+      th.textContent = col;
+      th.onclick = ()=>{ if (sortKey===col) sortDir*=-1; else { sortKey=col; sortDir=1; } render(); };
+      tr.appendChild(th);
+    });
+    thead.appendChild(tr);
+  }
+
+  function renderTableBody(rows){
+    const tbody = document.getElementById('tbody');
+    tbody.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    rows.forEach(r=>{
+      const tr = document.createElement('tr');
+      COLUMNS.forEach(c=>{
+        const td = document.createElement('td');
+        td.appendChild(hyperlinkify(c, r, r[c]));
+        tr.appendChild(td);
+      });
+      frag.appendChild(tr);
+    });
+    tbody.appendChild(frag);
+  }
+
+  function exportCsv(rows){
+    const esc = v => '"' + (v ?? '').toString().replace(/"/g, '""') + '"';
+    const header = COLUMNS.join(",");
+    const body = rows.map(r => COLUMNS.map(c => {
+      if (META.fee_cols && META.fee_cols.includes(c)) return esc(formatPercent(r[c]));
+      return esc(r[c]);
+    }).join(",")).join("\n");
+    const csv = header + "\n" + body;
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = "ppm-filter-export.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function render(){
+    const filtered = applyFilters(DATA);
+    const sorted = sortRows(filtered);
+    renderTableBody(sorted);
+    postHeight();
+  }
+
+  // Wire up controls
+  document.getElementById('clearBtn').onclick = ()=>{
+    document.getElementById('globalSearch').value='';
+    filters.global='';
+    filters.cols = Object.fromEntries(COLUMNS.map(c=>[c,'']));
+    sortKey=null; sortDir=1;
+    render();
+  };
+  document.getElementById('csvBtn').onclick = ()=>{
+    const filtered = applyFilters(DATA);
+    const sorted = sortRows(filtered);
+    exportCsv(sorted);
+  };
+  document.getElementById('globalSearch').oninput = (e)=>{
+    filters.global = e.target.value;
+    render();
+  };
+
+  // Load JSON bundle
+  fetch('./ppm-data.json')
+    .then(r=>r.json())
+    .then(bundle=>{
+      COLUMNS = bundle.columns;
+      DATA = bundle.rows;
+      META = bundle.meta || {};
+      filters.cols = Object.fromEntries(COLUMNS.map(c=>[c,'']));
+      // uniques
+      COLUMNS.forEach(c => uniqueMap[c] = new Set());
+      DATA.forEach(r => COLUMNS.forEach(c => uniqueMap[c].add(norm(r[c]))));
+      // Build filters and table:
+      buildColumnFilters();
+      renderTableHead();
+      render();
+    })
+    .catch(err=>{
+      console.error('Kunde inte läsa ppm-data.json', err);
+    });
+</script>
+</body>
+</html>
